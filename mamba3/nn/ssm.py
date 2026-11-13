@@ -89,7 +89,7 @@ def ssm_chunked_forward(
         b_t = gamma * (apply_rotation(b, cum_rotation) @ x)
         curr_z = z_a + b_m1 + b_t
         
-        return curr_z, curr_z
+        return (curr_z, cum_rotation, b), curr_z
     
     last_x_init = jnp.concatenate([last_x, x[..., :-1]], axis=1)
     x_init = x
@@ -97,12 +97,12 @@ def ssm_chunked_forward(
     b_init = B
     last_cum_rotation_init = jnp.concatenate([last_cum_rotation, cum_rotations[..., :-1]], axis=1)
     cum_rotation_init = cum_rotations
-    new_z, _ = jax.lax.scan(
+    (latest_state, latest_rotation, latest_b), states = jax.lax.scan(
         forward, z, (x_init, last_x_init, b_init, last_b_init, C, 
          alpha, beta, gamma, last_cum_rotation_init, cum_rotation_init)
     )
     
-    return new_z, cum_rotations[:,-1:-1,:], B[:,-1:-1,:]
+    return (latest_state, latest_rotation, latest_b), states
     
 def sequencial_chunk(x: jax.Array, block_size: int, axis: int):
     axis_size = x.shape[axis]
@@ -114,23 +114,23 @@ def sequencial_chunk(x: jax.Array, block_size: int, axis: int):
 
 def ssm_forward(
     in_proj: nnx.Linear, 
-    x: jax.Array,
-    b_bias: jax.Array,
-    c_bias: jax.Array,
+    x: jax.Array, # (B, L, C)
+    b_bias: jax.Array, # (H,D)
+    c_bias: jax.Array, # (P,D)
     norm: RMSNorm,
-    init_state: jax.Array,
-    state_size: int,
+    init_state: jax.Array, # (D,)
     pre_head_size: int,
     post_head_size: int,
     block_size: int,
 ):
     B, L, _ = x.shape
+    state_size = init_state.shape[-1]
     xABC = in_proj(x)
     
     x, a, b, c, theta, dt, lam = jnp.split(
         xABC, 
         [pre_head_size * state_size,
-         state_size // 2,
+         state_size,
          pre_head_size * state_size,
          post_head_size * state_size,
          state_size // 2,
@@ -140,18 +140,15 @@ def ssm_forward(
     )
     
     x = x.reshape(B, L, pre_head_size, state_size)
-    a = a.reshape(B, L, state_size // 2)
+    a = a.reshape(B, L, state_size)
     b = b.reshape(B, L, pre_head_size, state_size)
     c = c.reshape(B, L, post_head_size, state_size)
     theta = theta.reshape(B, L, state_size // 2)
     dt = dt.reshape(B, L, 1)
     lam = lam.reshape(B, L, 1)
     
-    b = b + b_bias[None,None,:]
-    c = c + c_bias[None,None,:]
-    
-    b = norm(b)
-    c = norm(c)
+    b = norm(b + b_bias[None,None,:])
+    c = norm(c + c_bias[None,None,:])
     
     x_chunked = sequencial_chunk(x[:,1:,:], block_size, axis=1)
     a_chunked = sequencial_chunk(a[:,1:,:], block_size, axis=1)
@@ -168,36 +165,44 @@ def ssm_forward(
     init_dt = dt[:,0:0]
     
     # Chunk inputs
-    def forward(carry, inputs):
+    def forward(carry, chnks):
         z, last_x, last_b, last_rotation = carry
-        x_chunk, a_chunk, b_chunk, c_chunk, theta_chunk, dt_chunk, lam_chunk = inputs
+        x_chunk, a_chunk, b_chunk, c_chunk, theta_chunk, dt_chunk, lam_chunk = chnks
         
-        (curr_z, curr_b, cum_rotation), _ = ssm_chunked_forward(
+        (curr_z, curr_b, cum_rotation), states = ssm_chunked_forward(
             x_chunk, last_x, z, a_chunk, b_chunk, last_b, c_chunk, 
             last_rotation, theta_chunk, dt_chunk, lam_chunk, 
             block_size=block_size
         )
+
+        curr_c_rotated = apply_rotation(c_chunk, cum_rotation)
+        curr_c_rotated_t = jnp.transpose(curr_c_rotated[...,None], axes=(0, 1, 2, 4, 3))
+        y = jnp.einsum(
+            "...ij,...jk->...ik", curr_c_rotated_t,
+            jnp.sum(states, axis=2)[...,None]
+        )
         
-        return (curr_z, curr_b, cum_rotation), curr_z
+        return (curr_z, curr_b, cum_rotation), y
     
+    # Iterate over chunks 
+    #(state, _, _, _), y_chnk = jax.lax.scan(
+    #    forward, init_carry, 
+    #    (x_chunked, a_chunked, b_chunked, c_chunked,
+    #     theta_chunked, dt_chunked, lam_chunked)
+    #)
+
+
     init_rotation = compute_discrete_rotary_blocks(init_dt * init_theta)
-    init_carry = (init_state, init_x, init_b, init_rotation)
+    last_carry = (init_state, init_x, init_b, init_rotation)
+    y_list = []
+    for _, chnk in enumerate(zip(x_chunked, a_chunked, c_chunked, 
+        theta_chunked, dt_chunked, lam_chunked)
+    ):
+        carry, y = forward(last_carry, chnk)
+        last_carry = carry
+        y_list.append(y)
+
+    y = jnp.stack(y_list, axis=1).reshape(B, L, post_head_size, state_size)
     
-    # Scan over chunks 
-    (state, _, _, curr_rotation), y = jax.lax.scan(
-        forward, init_carry, 
-        (x_chunked, a_chunked, b_chunked, c_chunked,
-         theta_chunked, dt_chunked, lam_chunked)
-    )
-    
-    curr_c = c_chunked[:,-1,-1,:] # (B, H, D)
-    curr_c_rotated_t = jnp.transpose(
-        apply_rotation(curr_c, curr_rotation), axes=(0, 2, 1)
-    )
-    y = jnp.einsum(
-        "bih,bhj->bij", curr_c_rotated_t, 
-        jnp.sum(state, axis=1, keepdims=True)
-    )
-    
-    return state, y
+    return last_carry[0], y
     
