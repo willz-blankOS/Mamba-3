@@ -118,7 +118,9 @@ def ssm_forward(
     b_bias: jax.Array, # (H,D)
     c_bias: jax.Array, # (P,D)
     norm: RMSNorm,
-    init_state: jax.Array, # (D,)
+    init_state: jax.Array, # (H, D)
+    init_x: jax.Array, # (H, D)
+    init_b: jax.Array, # (H, D)
     pre_head_size: int,
     post_head_size: int,
     block_size: int,
@@ -150,13 +152,13 @@ def ssm_forward(
     b = norm(b + b_bias[None,None,:])
     c = norm(c + c_bias[None,None,:])
     
-    x_chunked = sequencial_chunk(x[:,1:,:], block_size, axis=1)
-    a_chunked = sequencial_chunk(a[:,1:,:], block_size, axis=1)
-    b_chunked = sequencial_chunk(b[:,1:,:], block_size, axis=1)
-    c_chunked = sequencial_chunk(c[:,1:,:], block_size, axis=1)
-    theta_chunked = sequencial_chunk(theta[:,1:,:], block_size, axis=1)
-    dt_chunked = sequencial_chunk(dt[:,1:], block_size, axis=1)
-    lam_chunked = sequencial_chunk(lam[:,1:], block_size, axis=1)
+    x_chunked = sequencial_chunk(x, block_size, axis=1)
+    a_chunked = sequencial_chunk(a, block_size, axis=1)
+    b_chunked = sequencial_chunk(b, block_size, axis=1)
+    c_chunked = sequencial_chunk(c, block_size, axis=1)
+    theta_chunked = sequencial_chunk(theta, block_size, axis=1)
+    dt_chunked = sequencial_chunk(dt, block_size, axis=1)
+    lam_chunked = sequencial_chunk(lam, block_size, axis=1)
     
     # Slice initial values
     init_x = x[:,:,0:0,:]
@@ -195,7 +197,7 @@ def ssm_forward(
     init_rotation = compute_discrete_rotary_blocks(init_dt * init_theta)
     last_carry = (init_state, init_x, init_b, init_rotation)
     y_list = []
-    for _, chnk in enumerate(zip(x_chunked, a_chunked, c_chunked, 
+    for _, chnk in enumerate(zip(x_chunked, a_chunked, b_chunked, c_chunked, 
         theta_chunked, dt_chunked, lam_chunked)
     ):
         carry, y = forward(last_carry, chnk)
