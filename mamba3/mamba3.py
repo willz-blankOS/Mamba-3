@@ -5,16 +5,17 @@ import jax
 import jax.numpy as jnp
 import flax.nnx as nnx
 
-from nn.ssm import ssm_forward
-from nn.linear import MLP, MLP_Config
+from mamba3.nn.ssm import ssm_forward
+from mamba3.nn.linear import MLP
+from mamba3.nn.norm import RMSNorm
 
 @dataclasses.dataclass(frozen=True)
 class Mamba3_Config:
     hidden_dims: int = 512
-    state_size: int = 128
-    pre_heads: int = 4
-    post_heads: int = 4
-    chunk_size: int = 4
+    state_dims: int = 64
+    heads: int = 8
+    rank_size: int = 4
+    chunk_size: int = 8
 
     mlp_inner_dims: int = 896
     mlp_act_fn: Literal["silu", "gelu", "relu", "tanh"] = "silu"
@@ -32,58 +33,68 @@ class Mamba3(nnx.Module):
     ):
         self.hidden_dims = cfg.hidden_dims
         self.state_dims = cfg.state_dims
-        self.pre_heads = cfg.pre_heads
-        self.post_heads = cfg.post_heads
+        self.heads = cfg.heads
+        self.rank_size = cfg.rank_size
         self.chunk_size = cfg.chunk_size
+
+        self.norm = RMSNorm(self.rank_size, rngs=rngs)
         
         self.in_proj = nnx.Linear(
             self.hidden_dims,
-            (2 * (self.pre_heads * self.state_dims) + (self.post_heads * self.state_dims)
-             + self.state_dims + self.state_dims // 2 + 2 * self.pre_heads),
-            use_bias=False,
+            (self.heads * self.rank_size) + self.state_dims + 
+             2 * (self.state_dims * self.rank_size) + self.state_dims // 2 + 2,
+            use_bias=cfg.use_bias,
             rngs=rngs
         )
 
         self.resid_proj = nnx.Linear(
             self.hidden_dims,
-            self.post_heads * self.state_dims,
+            self.heads * self.rank_size,
+            use_bias=cfg.use_bias,
             rngs=rngs
         )
 
         self.out_proj = nnx.Linear(
-            self.post_heads * self.state_dims,
+            self.heads * self.rank_size,
             self.hidden_dims,
+            use_bias=cfg.use_bias,
             rngs=rngs
         )
 
         self.b_bias = nnx.Param(
-            jnp.ones((self.pre_heads, self.state_dims))
+            jnp.zeros((self.state_dims, self.rank_size))
         )
 
         self.c_bias = nnx.Param(
-            jnp.ones((self.post_heads, self.state_dims))
+            jnp.zeros((self.state_dims, self.rank_size))
         )
 
-    def generate_init_state_and_input(self):
-        state = jnp.zeros((self.pre_heads, self.state_dims))
-        x = jnp.zeros((self.pre_heads, self.state_dims))
-        b = jnp.zeros((self.pre_heads, self.state_dims))
-        return state, x, b
+    def generate_init_state_and_input(self, batch_size):
+        state = jnp.zeros((batch_size, self.state_dims, self.heads)) # (B, D, H)
+        x = jnp.zeros((batch_size, self.heads, self.rank_size)) # (B, H, R)
+        b = jnp.zeros((batch_size, self.state_dims, self.rank_size)) # (B, D, R)
+        dt = jnp.broadcast_to(jnp.array([1e-4]), shape=(batch_size, self.state_dims,)) #(D,)
+        return state, x, b, dt
 
     def __call__(self, x: jax.Array):
-        B, L, D = x.shape
+        B, L, _ = x.shape
 
-        init_state, init_x, init_b = self.generate_init_state_and_input()
+        if L < self.chunk_size:
+            chunk_size = L
+        else:
+            chunk_size = self.chunk_size
+
+        init_state, init_x, init_b, _ = self.generate_init_state_and_input(B)
 
         state, y = ssm_forward(self.in_proj, x, self.b_bias.value, 
-            self.c_bias.value, self.norm, init_x, init_state, init_b,
-            self.pre_heads, self.post_heads, self.chunk_size)
+            self.c_bias.value, self.norm, init_state, init_x, init_b,
+            self.heads, self.rank_size, chunk_size)
 
-        resid_x = self.resid_proj(x[:,-1,:])
-        resid_x = resid_x.reshape(B, self.post_heads, self.state_dims)
+        resid_x = self.resid_proj(x)
+        resid_x = resid_x.reshape(B, L, self.heads, self.rank_size)
 
-        y = jnp.multiply(y, nnx.silu(resid_x))
-        y = y.reshape(B, L, self.post_heads * self.state_dims)
+        y = jnp.multiply(y, nnx.sigmoid(resid_x))
+        y = y.reshape(B, L, self.rank_size * self.heads)
         y = self.out_proj(y)
 
         return state, y
@@ -124,6 +135,7 @@ class Mamba3MLP(nnx.Module):
             rngs: nnx.Rngs):
         super().__init__()
 
+        self.hidden_dims = cfg.hidden_dims
         self.num_layers = cfg.num_mamba_layers * 2 + 1
 
         layers = []
@@ -137,8 +149,15 @@ class Mamba3MLP(nnx.Module):
         self.padding_token = nnx.Param(
             nnx.initializers.normal(stddev=1.0)(rngs(), (cfg.hidden_dims,))
         )
+
+        self.norm = RMSNorm(self.hidden_dims, rngs=rngs)
         
     def __call__(self, x: jax.Array):
+        y = jnp.zeros_like(x)
         for layer in self.layers:
-            _, x = layer(x)
+            if type(layer) == Mamba3:
+                y = y + layer(self.norm(x))[1]
+            else:
+                y = y + layer(self.norm(x))
         return x
+    
