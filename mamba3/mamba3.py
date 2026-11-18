@@ -43,30 +43,30 @@ class Mamba3(nnx.Module):
             self.hidden_dims,
             (self.heads * self.rank_size) + self.state_dims + 
              2 * (self.state_dims * self.rank_size) + self.state_dims // 2 + 2,
-            use_bias=cfg.use_bias,
+            use_bias=False,
             rngs=rngs
         )
 
         self.resid_proj = nnx.Linear(
             self.hidden_dims,
             self.heads * self.rank_size,
-            use_bias=cfg.use_bias,
+            use_bias=True,
             rngs=rngs
         )
 
         self.out_proj = nnx.Linear(
             self.heads * self.rank_size,
             self.hidden_dims,
-            use_bias=cfg.use_bias,
+            use_bias=False,
             rngs=rngs
         )
 
         self.b_bias = nnx.Param(
-            jnp.zeros((self.state_dims, self.rank_size))
+            jnp.ones((self.state_dims, self.rank_size))
         )
 
         self.c_bias = nnx.Param(
-            jnp.zeros((self.state_dims, self.rank_size))
+            jnp.ones((self.state_dims, self.rank_size))
         )
 
     def generate_init_state_and_input(self, batch_size):
