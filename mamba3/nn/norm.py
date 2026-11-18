@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import flax.nnx as nnx
 
 class RMSNorm(nnx.Module):
-    def __init__(self, dim: int, eps: float = 1e-5, *, rngs: nnx.Rngs):
+    def __init__(self, dim: int, eps: float = 1e-3, *, rngs: nnx.Rngs):
         super().__init__()
         self.weight = nnx.Param(
             nnx.initializers.ones(rngs(), (dim,))
