@@ -157,12 +157,12 @@ def ssm_forward(
     b = b.reshape(B, L, state_size, rank_size) # (B, L, D, R)
     c = c.reshape(B, L, state_size, rank_size) # (B, L, D, R)
     theta = theta.reshape(B, L, state_size // 2) # (B, L, D//2)
-    dt = jax.nn.softplus(dt.reshape(B, L, 1) + 1e-4) # (B, L, 1)
+    dt = jax.nn.sigmoid(dt.reshape(B, L, 1)) * 0.1 + 1e-4 # (B, L, 1)
     lam = jax.nn.sigmoid(lam.reshape(B, L, 1)) # (B, L, 1)
 
     # Normalize expansion and contraction
-    b = norm(b + b_bias[None,:,:])
-    c = norm(c + c_bias[None,:,:])
+    b = norm(b) + b_bias[None,:,:]
+    c = norm(c) + c_bias[None,:,:]
     
     x_chunked = sequencial_chunk(x, block_size, axis=1)
     a_chunked = sequencial_chunk(a, block_size, axis=1)
