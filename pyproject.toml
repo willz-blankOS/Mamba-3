@@ -7,7 +7,7 @@ name = "mamba3"
 version = "0.1.0"
 description = "JAX/Flax NNX implementation of Mamba3 model"
 readme = {file = "README.md", content-type = "text/markdown"}
-requires-python = "<=3.12"
+requires-python = ">=3.12"
 dependencies = [
     "flax",
     "jax[cuda13]",
